@@ -13,6 +13,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "364177709")
 
 MIN_POSITION_DIFF = 7
 LATE_GAME_MINUTE = 75
+MIN_ALERT_MINUTE = 20  # No alertar antes del minuto 20
 POLL_INTERVAL = 90
 
 TOP_LEAGUES = {
@@ -283,6 +284,10 @@ def process_fixture(fixture: dict):
         minute = f["status"]["elapsed"] or 0
 
         if status not in ["1H", "HT", "2H", "ET", "P"]:
+            return
+
+        # No alertar en los primeros minutos
+        if minute < MIN_ALERT_MINUTE:
             return
 
         league = fixture["league"]
