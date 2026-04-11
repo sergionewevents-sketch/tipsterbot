@@ -38,18 +38,10 @@ alerted = {
     "yellow4": set(),
 }
 
-# ============================================================
-# ESTADÍSTICAS
-# Cada alerta se guarda con fixture_id y tipo
-# Al final del partido se comprueba el resultado
-# ============================================================
-# pending_stats: {fixture_id: [{tipo, alerta_data}, ...]}
 pending_stats = {}
-
-# stats acumuladas del día y semana
-# {tipo: {alertas, exitos, fallos}}
 daily_stats = {}
 weekly_stats = {}
+resolved_fixtures = set()
 
 ALERT_TYPES = ["goal_underdog", "red_underdog", "double_red", "late_game", "combo"]
 ALERT_LABELS = {
@@ -71,23 +63,21 @@ init_stats(weekly_stats)
 last_daily_report = None
 last_weekly_report = None
 
-# Cache de partidos terminados ya procesados para estadísticas
-resolved_fixtures = set()
-
-# ============================================================
-# CACHÉ
-# ============================================================
+# Cache de clasificaciones
 standings_cache = {}
 standings_cache_time = {}
 STANDINGS_TTL = 6 * 3600
 
+# Cache de eventos — solo para partidos interesantes
 events_cache = {}
 events_cache_time = {}
 EVENTS_TTL = 120
 
-interesting_fixtures = set()
-uninteresting_fixtures = set()
+# Partidos ya clasificados
+interesting_fixtures = set()   # tienen diferencia >= 7
+uninteresting_fixtures = set() # no tienen diferencia
 
+# Contador de llamadas
 api_calls_today = 0
 api_calls_date = None
 
@@ -116,8 +106,9 @@ def api_get(endpoint: str, params: dict = {}):
     if api_calls_date != today:
         api_calls_today = 0
         api_calls_date = today
-    if api_calls_today >= 98:
-        log.error("Límite de API alcanzado")
+        log.info("Contador de llamadas API reiniciado")
+    if api_calls_today >= 7400:
+        log.warning("Límite de API cercano, saltando llamada")
         return []
     try:
         r = requests.get(f"{BASE_URL}/{endpoint}", headers=HEADERS, params=params, timeout=15)
@@ -158,34 +149,26 @@ def get_fixture_events(fixture_id: int):
     return data
 
 # ============================================================
-# REGISTRAR ALERTA PARA ESTADÍSTICAS
+# ESTADÍSTICAS
 # ============================================================
-def register_alert(fixture_id: int, alert_type: str, favorite_id: int, underdog_id: int, score_home: int, score_away: int, home_id: int):
-    """Guarda la alerta pendiente de resolución al final del partido."""
+def register_alert(fixture_id, alert_type, favorite_id, underdog_id, score_home, score_away, home_id):
     if fixture_id not in pending_stats:
         pending_stats[fixture_id] = []
     pending_stats[fixture_id].append({
         "type": alert_type,
         "favorite_id": favorite_id,
-        "underdog_id": underdog_id,
-        "score_at_alert_home": score_home,
-        "score_at_alert_away": score_away,
         "home_id": home_id,
-        "resolved": False,
     })
     daily_stats[alert_type]["alertas"] += 1
     weekly_stats[alert_type]["alertas"] += 1
 
 def resolve_finished_fixtures(live_fixture_ids: set):
-    """Comprueba alertas de partidos que ya no están en live (terminaron)."""
     finished = set(pending_stats.keys()) - live_fixture_ids - resolved_fixtures
     for fixture_id in finished:
         resolved_fixtures.add(fixture_id)
         alerts = pending_stats.pop(fixture_id, [])
         if not alerts:
             continue
-
-        # Obtener resultado final
         result_data = api_get("fixtures", {"id": fixture_id})
         if not result_data:
             continue
@@ -194,92 +177,56 @@ def resolve_finished_fixtures(live_fixture_ids: set):
             final_home = f["goals"]["home"] or 0
             final_away = f["goals"]["away"] or 0
             home_id = f["teams"]["home"]["id"]
-            away_id = f["teams"]["away"]["id"]
         except Exception as e:
-            log.error(f"Error obteniendo resultado final: {e}")
+            log.error(f"Error resultado final: {e}")
             continue
-
         for alert in alerts:
             try:
                 favorite_id = alert["favorite_id"]
                 alert_type = alert["type"]
-
-                # Determinar si el favorito ganó o empató (éxito)
                 if favorite_id == home_id:
-                    fav_final = final_home
-                    und_final = final_away
+                    fav_final, und_final = final_home, final_away
                 else:
-                    fav_final = final_away
-                    und_final = final_home
-
-                # Éxito = favorito remontó (ganó o empató)
+                    fav_final, und_final = final_away, final_home
                 success = fav_final >= und_final
-
                 if success:
                     daily_stats[alert_type]["exitos"] += 1
                     weekly_stats[alert_type]["exitos"] += 1
                 else:
                     daily_stats[alert_type]["fallos"] += 1
                     weekly_stats[alert_type]["fallos"] += 1
-
-                log.info(f"Estadística resuelta: {alert_type} — {'✅' if success else '❌'}")
+                log.info(f"Stat resuelta: {alert_type} {'✅' if success else '❌'}")
             except Exception as e:
-                log.error(f"Error resolviendo alerta: {e}")
+                log.error(f"Error resolviendo stat: {e}")
 
-# ============================================================
-# INFORMES DE ESTADÍSTICAS
-# ============================================================
-def format_stats_report(stats: dict, titulo: str) -> str:
+def format_stats_report(stats, titulo):
     lines = [f"📊 <b>{titulo}</b>\n"]
-    total_alertas = sum(stats[t]["alertas"] for t in ALERT_TYPES)
-
-    if total_alertas == 0:
+    total = sum(stats[t]["alertas"] for t in ALERT_TYPES)
+    if total == 0:
         lines.append("Sin alertas registradas en este período.")
         return "\n".join(lines)
-
     for t in ALERT_TYPES:
         s = stats[t]
         if s["alertas"] == 0:
             continue
         resueltas = s["exitos"] + s["fallos"]
         tasa = f"{round(s['exitos']/resueltas*100)}%" if resueltas > 0 else "pendiente"
-        lines.append(
-            f"{ALERT_LABELS[t]}\n"
-            f"  Alertas: {s['alertas']} | ✅ {s['exitos']} | ❌ {s['fallos']} | Tasa: {tasa}\n"
-        )
+        lines.append(f"{ALERT_LABELS[t]}\nAlertas: {s['alertas']} | ✅ {s['exitos']} | ❌ {s['fallos']} | Tasa: {tasa}\n")
     return "\n".join(lines)
-
-def send_daily_report():
-    now = datetime.now(timezone.utc)
-    titulo = f"RESUMEN DIARIO — {now.strftime('%A %d %B').capitalize()}"
-    msg = format_stats_report(daily_stats, titulo)
-    send_telegram(msg)
-    log.info("Informe diario enviado")
-    init_stats(daily_stats)  # reset
-
-def send_weekly_report():
-    now = datetime.now(timezone.utc)
-    titulo = f"RESUMEN SEMANAL — Semana del {now.strftime('%d %B %Y')}"
-    msg = format_stats_report(weekly_stats, titulo)
-    send_telegram(msg)
-    log.info("Informe semanal enviado")
-    init_stats(weekly_stats)  # reset
 
 def check_reports():
     global last_daily_report, last_weekly_report
     now = datetime.now(timezone.utc)
-
-    # Informe diario a las 23:00 UTC (01:00 hora España en verano)
     if now.hour == 23 and now.minute < 2:
         if last_daily_report is None or last_daily_report.date() != now.date():
             last_daily_report = now
-            send_daily_report()
-
-    # Informe semanal los domingos a las 23:00 UTC
+            send_telegram(format_stats_report(daily_stats, f"RESUMEN DIARIO — {now.strftime('%d/%m/%Y')}"))
+            init_stats(daily_stats)
     if now.weekday() == 6 and now.hour == 23 and now.minute < 2:
         if last_weekly_report is None or (now - last_weekly_report).days >= 6:
             last_weekly_report = now
-            send_weekly_report()
+            send_telegram(format_stats_report(weekly_stats, f"RESUMEN SEMANAL — {now.strftime('%d/%m/%Y')}"))
+            init_stats(weekly_stats)
 
 # ============================================================
 # PROCESAR PARTIDO
@@ -294,9 +241,6 @@ def process_fixture(fixture: dict):
         if status not in ["1H", "HT", "2H", "ET", "P"]:
             return
 
-        if fixture_id in uninteresting_fixtures:
-            return
-
         league = fixture["league"]
         league_id = league["id"]
         league_name = league["name"]
@@ -308,23 +252,49 @@ def process_fixture(fixture: dict):
         score_home = fixture["goals"]["home"] or 0
         score_away = fixture["goals"]["away"] or 0
 
-        # País en la cabecera
         league_header = f"🏆 {league_name} | 🌍 {country}" if country else f"🏆 {league_name}"
 
+        # ---- PASO 1: ¿Ya sabemos si este partido es interesante? ----
+        # Si ya está en uninteresting, lo saltamos completamente
+        if fixture_id in uninteresting_fixtures:
+            return
+
+        # ---- PASO 2: Si no lo sabemos, consultar standings (con caché) ----
+        if fixture_id not in interesting_fixtures:
+            standings = get_standings(league_id, season)
+            pos_home = standings.get(home["id"])
+            pos_away = standings.get(away["id"])
+
+            if pos_home and pos_away:
+                diff = abs(pos_home - pos_away)
+                if diff >= MIN_POSITION_DIFF:
+                    interesting_fixtures.add(fixture_id)
+                else:
+                    uninteresting_fixtures.add(fixture_id)
+                    return
+            else:
+                # Sin standings disponibles, saltamos
+                return
+
+        # ---- PASO 3: Solo llegamos aquí si el partido ES interesante ----
         standings = get_standings(league_id, season)
         pos_home = standings.get(home["id"])
         pos_away = standings.get(away["id"])
+        if not pos_home or not pos_away:
+            return
 
-        has_table_diff = False
-        diff = 0
-        if pos_home and pos_away:
-            diff = abs(pos_home - pos_away)
-            if diff >= MIN_POSITION_DIFF:
-                has_table_diff = True
-                interesting_fixtures.add(fixture_id)
-            else:
-                uninteresting_fixtures.add(fixture_id)
+        diff = abs(pos_home - pos_away)
 
+        if pos_home > pos_away:
+            underdog, favorite = home, away
+            underdog_score, fav_score = score_home, score_away
+            underdog_pos, fav_pos = pos_home, pos_away
+        else:
+            underdog, favorite = away, home
+            underdog_score, fav_score = score_away, score_home
+            underdog_pos, fav_pos = pos_away, pos_home
+
+        # ---- PASO 4: Ahora sí pedimos eventos (solo partidos interesantes) ----
         events = get_fixture_events(fixture_id)
 
         reds = {home["id"]: [], away["id"]: []}
@@ -336,79 +306,34 @@ def process_fixture(fixture: dict):
                 if team_id in reds:
                     reds[team_id].append({"player": player, "minute": ev_minute})
 
-        if has_table_diff:
-            if pos_home > pos_away:
-                underdog, favorite = home, away
-                underdog_score, fav_score = score_home, score_away
-                underdog_pos, fav_pos = pos_home, pos_away
-            else:
-                underdog, favorite = away, home
-                underdog_score, fav_score = score_away, score_home
-                underdog_pos, fav_pos = pos_away, pos_home
-
-            # ALERTA 1: GOL UNDERDOG
-            if underdog_score > fav_score:
-                goal_key = f"{fixture_id}_{score_home}_{score_away}"
-                if goal_key not in alerted["goals"]:
-                    alerted["goals"].add(goal_key)
-                    send_telegram(
-                        f"⚽ <b>ALERTA TIPSTER — GOL UNDERDOG</b>\n"
-                        f"{league_header}\n"
-                        f"{home['name']} {score_home} - {score_away} {away['name']}\n"
-                        f"⬆️ {favorite['name']} es {diff} posiciones superior (#{fav_pos} vs #{underdog_pos})\n"
-                        f"⏱️ Min {minute}"
-                    )
-                    register_alert(fixture_id, "goal_underdog", favorite["id"], underdog["id"], score_home, score_away, home["id"])
-
-            # ALERTA 2: ROJA AL UNDERDOG
-            for red in reds[underdog["id"]]:
-                red_key = f"{fixture_id}_{underdog['id']}_{red['player']}"
-                if red_key not in alerted["red_underdog"]:
-                    alerted["red_underdog"].add(red_key)
-                    send_telegram(
-                        f"🟥 <b>ALERTA TIPSTER — ROJA AL UNDERDOG</b>\n"
-                        f"{league_header}\n"
-                        f"{home['name']} {score_home} - {score_away} {away['name']}\n"
-                        f"⬆️ {favorite['name']} es {diff} posiciones superior (#{fav_pos} vs #{underdog_pos})\n"
-                        f"👤 Expulsado: {red['player']} ({underdog['name']})\n"
-                        f"⏱️ Min {red['minute']}"
-                    )
-                    register_alert(fixture_id, "red_underdog", favorite["id"], underdog["id"], score_home, score_away, home["id"])
-
-            # ALERTA 4: MINUTO 75+
-            if minute >= LATE_GAME_MINUTE:
-                late_key = f"{fixture_id}_late"
-                if abs(score_home - score_away) <= 1 and late_key not in alerted["late_game"]:
-                    alerted["late_game"].add(late_key)
-                    if score_home > score_away:
-                        resultado = f"🔵 Gana {home['name']}"
-                    elif score_away > score_home:
-                        resultado = f"🔵 Gana {away['name']}"
-                    else:
-                        resultado = "⚖️ Empate"
-                    send_telegram(
-                        f"⏱️ <b>ALERTA TIPSTER — MINUTO 75+</b>\n"
-                        f"{league_header}\n"
-                        f"{home['name']} {score_home} - {score_away} {away['name']}\n"
-                        f"⬆️ {favorite['name']} es {diff} posiciones superior\n"
-                        f"🎯 Resultado ajustado en el minuto {minute}\n"
-                        f"{resultado}"
-                    )
-                    register_alert(fixture_id, "late_game", favorite["id"], underdog["id"], score_home, score_away, home["id"])
-
-            # ALERTA 5: COMBO GOL + ROJA
-            combo_key = f"{fixture_id}_combo"
-            if underdog_score > fav_score and len(reds[underdog["id"]]) > 0 and combo_key not in alerted["combo"]:
-                alerted["combo"].add(combo_key)
+        # ALERTA 1: GOL UNDERDOG
+        if underdog_score > fav_score:
+            goal_key = f"{fixture_id}_{score_home}_{score_away}"
+            if goal_key not in alerted["goals"]:
+                alerted["goals"].add(goal_key)
                 send_telegram(
-                    f"🔄 <b>ALERTA TIPSTER — COMBO GOL + ROJA</b>\n"
+                    f"⚽ <b>ALERTA TIPSTER — GOL UNDERDOG</b>\n"
                     f"{league_header}\n"
                     f"{home['name']} {score_home} - {score_away} {away['name']}\n"
-                    f"⬆️ {favorite['name']} es {diff} posiciones superior\n"
-                    f"⚠️ {underdog['name']} va ganando Y tiene expulsado\n"
+                    f"⬆️ {favorite['name']} es {diff} posiciones superior (#{fav_pos} vs #{underdog_pos})\n"
                     f"⏱️ Min {minute}"
                 )
-                register_alert(fixture_id, "combo", favorite["id"], underdog["id"], score_home, score_away, home["id"])
+                register_alert(fixture_id, "goal_underdog", favorite["id"], underdog["id"], score_home, score_away, home["id"])
+
+        # ALERTA 2: ROJA AL UNDERDOG
+        for red in reds[underdog["id"]]:
+            red_key = f"{fixture_id}_{underdog['id']}_{red['player']}"
+            if red_key not in alerted["red_underdog"]:
+                alerted["red_underdog"].add(red_key)
+                send_telegram(
+                    f"🟥 <b>ALERTA TIPSTER — ROJA AL UNDERDOG</b>\n"
+                    f"{league_header}\n"
+                    f"{home['name']} {score_home} - {score_away} {away['name']}\n"
+                    f"⬆️ {favorite['name']} es {diff} posiciones superior (#{fav_pos} vs #{underdog_pos})\n"
+                    f"👤 Expulsado: {red['player']} ({underdog['name']})\n"
+                    f"⏱️ Min {red['minute']}"
+                )
+                register_alert(fixture_id, "red_underdog", favorite["id"], underdog["id"], score_home, score_away, home["id"])
 
         # ALERTA 3: DOBLE ROJA
         for team in [home, away]:
@@ -426,11 +351,46 @@ def process_fixture(fixture: dict):
                     )
                     register_alert(fixture_id, "double_red", other["id"], team["id"], score_home, score_away, home["id"])
 
+        # ALERTA 4: MINUTO 75+
+        if minute >= LATE_GAME_MINUTE:
+            late_key = f"{fixture_id}_late"
+            if abs(score_home - score_away) <= 1 and late_key not in alerted["late_game"]:
+                alerted["late_game"].add(late_key)
+                if score_home > score_away:
+                    resultado = f"🔵 Gana {home['name']}"
+                elif score_away > score_home:
+                    resultado = f"🔵 Gana {away['name']}"
+                else:
+                    resultado = "⚖️ Empate"
+                send_telegram(
+                    f"⏱️ <b>ALERTA TIPSTER — MINUTO 75+</b>\n"
+                    f"{league_header}\n"
+                    f"{home['name']} {score_home} - {score_away} {away['name']}\n"
+                    f"⬆️ {favorite['name']} es {diff} posiciones superior\n"
+                    f"🎯 Resultado ajustado en el minuto {minute}\n"
+                    f"{resultado}"
+                )
+                register_alert(fixture_id, "late_game", favorite["id"], underdog["id"], score_home, score_away, home["id"])
+
+        # ALERTA 5: COMBO GOL + ROJA
+        combo_key = f"{fixture_id}_combo"
+        if underdog_score > fav_score and len(reds[underdog["id"]]) > 0 and combo_key not in alerted["combo"]:
+            alerted["combo"].add(combo_key)
+            send_telegram(
+                f"🔄 <b>ALERTA TIPSTER — COMBO GOL + ROJA</b>\n"
+                f"{league_header}\n"
+                f"{home['name']} {score_home} - {score_away} {away['name']}\n"
+                f"⬆️ {favorite['name']} es {diff} posiciones superior\n"
+                f"⚠️ {underdog['name']} va ganando Y tiene expulsado\n"
+                f"⏱️ Min {minute}"
+            )
+            register_alert(fixture_id, "combo", favorite["id"], underdog["id"], score_home, score_away, home["id"])
+
     except Exception as e:
         log.error(f"Error procesando partido: {e}")
 
 # ============================================================
-# ALERTA PRE-PARTIDO: 4 AMARILLAS
+# 4 AMARILLAS
 # ============================================================
 last_yellow_check = None
 
@@ -443,7 +403,7 @@ def check_yellow_cards():
         return
     last_yellow_check = now
     season = now.year
-    log.info("Revisando jugadores con 4 tarjetas amarillas...")
+    log.info("Revisando 4 amarillas...")
     for league_name, league_id in TOP_LEAGUES.items():
         fixtures = api_get("fixtures", {"league": league_id, "season": season, "next": 10})
         teams_playing = set()
@@ -455,18 +415,15 @@ def check_yellow_cards():
             for p in players:
                 try:
                     stats = p["statistics"][0]
-                    yellows = stats["cards"]["yellow"]
-                    player_name = p["player"]["name"]
-                    player_id = p["player"]["id"]
-                    team_name = stats["team"]["name"]
-                    if yellows == 4:
+                    if stats["cards"]["yellow"] == 4:
+                        player_id = p["player"]["id"]
                         key = f"{player_id}_{season}"
                         if key not in alerted["yellow4"]:
                             alerted["yellow4"].add(key)
                             send_telegram(
                                 f"🟨🟨🟨🟨 <b>ALERTA PRE-PARTIDO — 4 AMARILLAS</b>\n"
                                 f"🏆 {league_name}\n"
-                                f"👤 {player_name} ({team_name})\n"
+                                f"👤 {p['player']['name']} ({stats['team']['name']})\n"
                                 f"⚠️ Tiene 4 amarillas — puede forzar la quinta\n"
                                 f"🔍 Revisa si juega hoy"
                             )
@@ -477,7 +434,7 @@ def check_yellow_cards():
 # BUCLE PRINCIPAL
 # ============================================================
 def main():
-    log.info("🚀 TipsterBot arrancado! (v3 — con estadísticas y países)")
+    log.info("🚀 TipsterBot v4 arrancado!")
     send_telegram("🚀 <b>TipsterBot activado</b>\nMonitorizando partidos en tiempo real...")
     cycle = 0
     while True:
@@ -485,20 +442,20 @@ def main():
             cycle += 1
             fixtures = api_get("fixtures", {"live": "all"})
             live_ids = {f["fixture"]["id"] for f in fixtures}
-            log.info(f"Ciclo {cycle} — Live: {len(fixtures)} — API calls hoy: {api_calls_today}")
+            interesting = len([f for f in fixtures if f["fixture"]["id"] in interesting_fixtures])
+            log.info(f"Ciclo {cycle} — Live: {len(fixtures)} | Interesantes: {interesting} | API calls: {api_calls_today}")
 
             for fixture in fixtures:
                 process_fixture(fixture)
 
-            # Resolver estadísticas de partidos terminados
             resolve_finished_fixtures(live_ids)
-
             check_yellow_cards()
             check_reports()
 
             if cycle % 100 == 0:
                 uninteresting_fixtures.clear()
                 interesting_fixtures.clear()
+                log.info("Caché de partidos limpiada")
 
         except Exception as e:
             log.error(f"Error en bucle principal: {e}")
