@@ -13,7 +13,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "364177709")
 
 MIN_POSITION_DIFF = 7
 LATE_GAME_MINUTE = 75
-MIN_ALERT_MINUTE = 20  # No alertar antes del minuto 20
+MIN_ALERT_MINUTE = 20
+MIN_CORNERS = 8  # Córners del favorito sin marcar para alertar
 POLL_INTERVAL = 90
 
 TOP_LEAGUES = {
@@ -63,6 +64,7 @@ alerted = {
     "combo": set(),
     "late_game": set(),
     "yellow4": set(),
+    "corners": set(),
 }
 
 pending_stats = {}
@@ -70,13 +72,14 @@ daily_stats = {}
 weekly_stats = {}
 resolved_fixtures = set()
 
-ALERT_TYPES = ["goal_underdog", "red_underdog", "double_red", "late_game", "combo"]
+ALERT_TYPES = ["goal_underdog", "red_underdog", "double_red", "late_game", "combo", "corners"]
 ALERT_LABELS = {
     "goal_underdog": "⚽ GOL UNDERDOG",
     "red_underdog":  "🟥 ROJA AL UNDERDOG",
     "double_red":    "🟥🟥 DOBLE ROJA",
     "late_game":     "⏱️ MINUTO 75+",
     "combo":         "🔄 COMBO GOL + ROJA",
+    "corners":       "🚩 PRESIÓN CÓRNERS",
 }
 
 def init_stats(d):
@@ -345,6 +348,7 @@ def process_fixture(fixture: dict):
         events = get_fixture_events(fixture_id)
 
         reds = {home["id"]: [], away["id"]: []}
+        corners = {home["id"]: 0, away["id"]: 0}
         for ev in events:
             if ev.get("type") == "Card" and ev.get("detail") in ["Red Card", "Second Yellow"]:
                 team_id = ev["team"]["id"]
@@ -352,6 +356,10 @@ def process_fixture(fixture: dict):
                 ev_minute = ev.get("time", {}).get("elapsed", 0)
                 if team_id in reds:
                     reds[team_id].append({"player": player, "minute": ev_minute})
+            elif ev.get("type") == "Corner":
+                team_id = ev["team"]["id"]
+                if team_id in corners:
+                    corners[team_id] += 1
 
         # ALERTA 1: GOL UNDERDOG
         if underdog_score > fav_score:
@@ -444,6 +452,23 @@ def process_fixture(fixture: dict):
                 f"⏱️ Min {minute}"
             )
             register_alert(fixture_id, "combo", favorite["id"], underdog["id"], score_home, score_away, home["id"])
+
+        # ALERTA 6: PRESIÓN CÓRNERS
+        # Favorito con 8+ córners sin haber marcado (o va perdiendo/empatando)
+        fav_corners = corners[favorite["id"]]
+        corners_key = f"{fixture_id}_corners_{fav_corners // MIN_CORNERS}"
+        if fav_corners >= MIN_CORNERS and fav_score <= underdog_score and corners_key not in alerted["corners"]:
+            alerted["corners"].add(corners_key)
+            und_corners = corners[underdog["id"]]
+            send_telegram(
+                f"🚩 <b>ALERTA TIPSTER — PRESIÓN CÓRNERS</b>\n"
+                f"{league_header}\n"
+                f"{home['name']} {score_home} - {score_away} {away['name']}\n"
+                f"⬆️ {favorite['name']} es {diff} posiciones superior\n"
+                f"📐 {favorite['name']}: {fav_corners} córners | {underdog['name']}: {und_corners}\n"
+                f"🎯 Presión sostenida sin recompensa\n"
+                f"⏱️ Min {minute}"
+            )
 
     except Exception as e:
         log.error(f"Error procesando partido: {e}")
