@@ -135,6 +135,57 @@ def send_telegram(message: str):
     except Exception as e:
         log.error(f"Telegram exception: {e}")
 
+last_update_id = None
+
+def check_telegram_commands():
+    """Escucha comandos entrantes de Telegram como /status."""
+    global last_update_id
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+        params = {"timeout": 0, "limit": 5}
+        if last_update_id:
+            params["offset"] = last_update_id + 1
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            return
+        updates = r.json().get("result", [])
+        for update in updates:
+            last_update_id = update["update_id"]
+            message = update.get("message", {})
+            text = message.get("text", "").strip().lower()
+            chat_id = message.get("chat", {}).get("id")
+            if str(chat_id) != str(TELEGRAM_CHAT_ID):
+                continue
+            if text == "/status":
+                send_status()
+    except Exception as e:
+        log.error(f"Error leyendo comandos Telegram: {e}")
+
+def send_status():
+    """Envía un resumen del estado actual del bot."""
+    now = datetime.now(timezone.utc)
+    total_alertas_hoy = sum(daily_stats[t]["alertas"] for t in ALERT_TYPES)
+    total_alertas_semana = sum(weekly_stats[t]["alertas"] for t in ALERT_TYPES)
+
+    msg = (
+        f"🤖 <b>ESTADO DEL BOT</b>\n\n"
+        f"✅ Activo y funcionando\n"
+        f"🕐 Hora UTC: {now.strftime('%H:%M:%S')}\n"
+        f"📡 API calls hoy: {api_calls_today}/7500\n\n"
+        f"📊 <b>Alertas hoy:</b> {total_alertas_hoy}\n"
+        f"📊 <b>Alertas esta semana:</b> {total_alertas_semana}\n\n"
+    )
+
+    # Desglose por tipo si hay alertas
+    if total_alertas_hoy > 0:
+        msg += "<b>Desglose de hoy:</b>\n"
+        for t in ALERT_TYPES:
+            s = daily_stats[t]
+            if s["alertas"] > 0:
+                msg += f"  {ALERT_LABELS[t]}: {s['alertas']} alertas\n"
+
+    send_telegram(msg)
+
 # ============================================================
 # API
 # ============================================================
@@ -596,6 +647,7 @@ def main():
             resolve_finished_fixtures(live_ids)
             check_yellow_cards()
             check_reports()
+            check_telegram_commands()
 
             if cycle % 100 == 0:
                 uninteresting_fixtures.clear()
