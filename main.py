@@ -582,6 +582,9 @@ def process_low_yellows(fixture: dict):
             )
             register_alert(fixture_id, "low_yellows", home["id"], away["id"], score_home, score_away, home["id"])
 
+    except Exception as e:
+        log.error(f"Error procesando pocas amarillas: {e}")
+
 # ============================================================
 # 4 AMARILLAS
 # ============================================================
