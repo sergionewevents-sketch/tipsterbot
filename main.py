@@ -24,6 +24,32 @@ LOW_YELLOW_LEAGUES = {
     78,   # Bundesliga
 }
 
+# Ligas para ESTADÍSTICAS TARJETAS y TARJETA A JUGADOR
+CARD_STATS_LEAGUES = {
+    140,  # LaLiga
+    135,  # Serie A
+    61,   # Ligue 1
+    78,   # Bundesliga
+    94,   # Primeira Liga
+}
+
+CARD_STATS_LEAGUE_NAMES = {
+    140: "LaLiga",
+    135: "Serie A",
+    61:  "Ligue 1",
+    78:  "Bundesliga",
+    94:  "Primeira Liga",
+}
+
+# Umbrales de amarillas acumuladas para alerta jugador
+YELLOW_THRESHOLDS = {4, 9, 14, 19, 24}
+
+# Número de partidos históricos para calcular media
+HISTORY_MATCHES = 10
+
+# % mínimo de tarjetas para NO alertar (si llevan menos del 30% → alerta)
+CARD_STATS_THRESHOLD = 0.30
+
 # Competiciones donde juegan equipos españoles (Champions, Europa League, Copa del Rey, etc.)
 SPANISH_CUPS = {
     "Copa del Rey", "Supercopa de España",
@@ -81,6 +107,9 @@ alerted = {
     "late_game": set(),
     "yellow4": set(),
     "low_yellows": set(),
+    "card_stats": set(),       # fixture_id
+    "player_yellow_70": set(), # fixture_id_player_id
+    "player_yellow_85": set(), # fixture_id_player_id
 }
 
 pending_stats = {}
@@ -88,14 +117,32 @@ daily_stats = {}
 weekly_stats = {}
 resolved_fixtures = set()
 
-ALERT_TYPES = ["red_underdog", "double_red", "late_game", "combo", "low_yellows"]
+ALERT_TYPES = ["red_underdog", "double_red", "late_game", "combo", "low_yellows", "card_stats", "player_yellow"]
 ALERT_LABELS = {
-    "red_underdog":  "🟥 ROJA AL UNDERDOG",
-    "double_red":    "🟥🟥 DOBLE ROJA",
-    "late_game":     "⏱️ MINUTO 75+",
-    "combo":         "🔄 COMBO GOL + ROJA",
-    "low_yellows":   "🟨 POCAS AMARILLAS",
+    "red_underdog":   "🟥 ROJA AL UNDERDOG",
+    "double_red":     "🟥🟥 DOBLE ROJA",
+    "late_game":      "⏱️ MINUTO 75+",
+    "combo":          "🔄 COMBO GOL + ROJA",
+    "low_yellows":    "🟨 POCAS AMARILLAS",
+    "card_stats":     "📊 ESTADÍSTICAS TARJETAS",
+    "player_yellow":  "🟨👤 TARJETA A JUGADOR",
 }
+
+# Cache de medias históricas de amarillas por equipo
+# team_id -> float
+yellow_avg_cache = {}
+yellow_avg_cache_time = {}
+YELLOW_AVG_TTL = 12 * 3600  # 12 horas
+
+# Cache de jugadores con 4/9/14... amarillas por liga
+# league_id -> [{player_id, player_name, team_id, team_name, yellows}]
+threshold_players_cache = {}
+threshold_players_cache_time = {}
+THRESHOLD_PLAYERS_TTL = 3 * 3600  # 3 horas
+
+# Estimaciones precalculadas por partido
+# fixture_id -> int (amarillas esperadas)
+fixture_yellow_estimate = {}
 
 def init_stats(d):
     for t in ALERT_TYPES:
@@ -239,6 +286,99 @@ def get_fixture_events(fixture_id: int):
     events_cache[fixture_id] = data
     events_cache_time[fixture_id] = now
     return data
+
+def get_team_yellow_avg(team_id: int, league_id: int, season: int) -> float:
+    """Calcula la media de amarillas por partido de un equipo en sus últimos 10 partidos."""
+    key = (team_id, league_id, season)
+    now = time.time()
+    if key in yellow_avg_cache and now - yellow_avg_cache_time.get(key, 0) < YELLOW_AVG_TTL:
+        return yellow_avg_cache[key]
+    try:
+        fixtures = api_get("fixtures", {
+            "team": team_id,
+            "league": league_id,
+            "season": season,
+            "last": HISTORY_MATCHES,
+            "status": "FT"
+        })
+        if not fixtures:
+            return 0.0
+        total_yellows = 0
+        count = 0
+        for f in fixtures:
+            fid = f["fixture"]["id"]
+            events = api_get("fixtures/events", {"fixture": fid, "type": "Card"})
+            for ev in events:
+                if ev.get("team", {}).get("id") == team_id and ev.get("detail") == "Yellow Card":
+                    total_yellows += 1
+            count += 1
+        avg = round(total_yellows / count, 2) if count > 0 else 0.0
+        yellow_avg_cache[key] = avg
+        yellow_avg_cache_time[key] = now
+        return avg
+    except Exception as e:
+        log.error(f"Error calculando media amarillas: {e}")
+        return 0.0
+
+def conservative_round(value: float) -> int:
+    """Redondeo conservador: 3.5 → 3, 3.6 → 4, 3.4 → 3."""
+    import math
+    if value - math.floor(value) > 0.5:
+        return math.ceil(value)
+    return math.floor(value)
+
+def get_threshold_players(league_id: int, season: int) -> list:
+    """Devuelve jugadores con 4,9,14,19,24 amarillas en la liga."""
+    key = (league_id, season)
+    now = time.time()
+    if key in threshold_players_cache and now - threshold_players_cache_time.get(key, 0) < THRESHOLD_PLAYERS_TTL:
+        return threshold_players_cache[key]
+    try:
+        standings = api_get("standings", {"league": league_id, "season": season})
+        if not standings:
+            return []
+        teams = [t["team"]["id"] for t in standings[0]["league"]["standings"][0]]
+        result = []
+        for team_id in teams:
+            players = api_get("players", {"team": team_id, "league": league_id, "season": season})
+            for p in players:
+                try:
+                    yellows = p["statistics"][0]["cards"]["yellow"]
+                    if yellows in YELLOW_THRESHOLDS:
+                        result.append({
+                            "player_id": p["player"]["id"],
+                            "player_name": p["player"]["name"],
+                            "team_id": team_id,
+                            "team_name": p["statistics"][0]["team"]["name"],
+                            "yellows": yellows,
+                        })
+                except Exception:
+                    continue
+        threshold_players_cache[key] = result
+        threshold_players_cache_time[key] = now
+        return result
+    except Exception as e:
+        log.error(f"Error obteniendo jugadores umbral: {e}")
+        return []
+
+def get_next_fixtures(team_id: int, league_id: int, season: int, n: int = 2) -> list:
+    """Devuelve los próximos N partidos de un equipo."""
+    try:
+        fixtures = api_get("fixtures", {
+            "team": team_id,
+            "league": league_id,
+            "season": season,
+            "next": n
+        })
+        result = []
+        for f in fixtures:
+            date = f["fixture"]["date"][:10]
+            home = f["teams"]["home"]["name"]
+            away = f["teams"]["away"]["name"]
+            result.append(f"{date}: {home} vs {away}")
+        return result
+    except Exception:
+        return []
 
 # ============================================================
 # ESTADÍSTICAS
@@ -627,10 +767,180 @@ def check_yellow_cards():
                     continue
 
 # ============================================================
+# ALERTA ESTADÍSTICAS TARJETAS
+# ============================================================
+def process_card_stats(fixture: dict):
+    """Si en el min 65+ llevan menos del 30% de amarillas esperadas → alerta."""
+    try:
+        f = fixture["fixture"]
+        fixture_id = f["id"]
+        status = f["status"]["short"]
+        minute = f["status"]["elapsed"] or 0
+
+        if status not in ["1H", "HT", "2H", "ET", "P"]:
+            return
+        if minute < 65:
+            return
+
+        league = fixture["league"]
+        league_id = league["id"]
+        if league_id not in CARD_STATS_LEAGUES:
+            return
+
+        league_name = league["name"]
+        country = league.get("country", "")
+        season = league["season"]
+        league_header = f"🏆 {league_name} | 🌍 {country}" if country else f"🏆 {league_name}"
+
+        home = fixture["teams"]["home"]
+        away = fixture["teams"]["away"]
+        score_home = fixture["goals"]["home"] or 0
+        score_away = fixture["goals"]["away"] or 0
+
+        card_key = f"{fixture_id}_cardstats"
+        if card_key in alerted["card_stats"]:
+            return
+
+        # Calcular estimación si no la tenemos
+        if fixture_id not in fixture_yellow_estimate:
+            avg_home = get_team_yellow_avg(home["id"], league_id, season)
+            avg_away = get_team_yellow_avg(away["id"], league_id, season)
+            estimated = conservative_round(avg_home + avg_away)
+            fixture_yellow_estimate[fixture_id] = estimated
+            log.info(f"Estimación amarillas {home['name']} vs {away['name']}: {avg_home}+{avg_away}={estimated}")
+
+        estimated = fixture_yellow_estimate[fixture_id]
+        if estimated < 1:
+            return
+
+        # Contar amarillas actuales
+        events = get_fixture_events(fixture_id)
+        current_yellows = sum(
+            1 for ev in events
+            if ev.get("type") == "Card" and ev.get("detail") == "Yellow Card"
+        )
+
+        pct = current_yellows / estimated
+        if pct < CARD_STATS_THRESHOLD:
+            alerted["card_stats"].add(card_key)
+            daily_stats["card_stats"]["alertas"] += 1
+            weekly_stats["card_stats"]["alertas"] += 1
+            send_telegram(
+                f"📊 <b>ALERTA TIPSTER — ESTADÍSTICAS TARJETAS</b>\n"
+                f"{league_header}\n"
+                f"{home['name']} {score_home} - {score_away} {away['name']}\n"
+                f"🟨 Amarillas actuales: {current_yellows}\n"
+                f"📈 Amarillas esperadas: {estimated}\n"
+                f"📉 Solo el {round(pct*100)}% de lo esperado\n"
+                f"⏱️ Min {minute}"
+            )
+
+    except Exception as e:
+        log.error(f"Error en card stats: {e}")
+
+# ============================================================
+# ALERTA TARJETA A JUGADOR
+# ============================================================
+def process_player_yellow(fixture: dict):
+    """Si jugador con 4/9/14/19/24 amarillas llega al min 70 u 85 sin amarilla → alerta."""
+    try:
+        f = fixture["fixture"]
+        fixture_id = f["id"]
+        status = f["status"]["short"]
+        minute = f["status"]["elapsed"] or 0
+
+        if status not in ["1H", "HT", "2H", "ET", "P"]:
+            return
+        if minute < 70:
+            return
+
+        league = fixture["league"]
+        league_id = league["id"]
+        if league_id not in CARD_STATS_LEAGUES:
+            return
+
+        league_name = league["name"]
+        country = league.get("country", "")
+        season = league["season"]
+        league_header = f"🏆 {league_name} | 🌍 {country}" if country else f"🏆 {league_name}"
+
+        home = fixture["teams"]["home"]
+        away = fixture["teams"]["away"]
+        score_home = fixture["goals"]["home"] or 0
+        score_away = fixture["goals"]["away"] or 0
+        playing_teams = {home["id"], away["id"]}
+
+        # Obtener jugadores en umbral de esta liga
+        threshold_players = get_threshold_players(league_id, season)
+        if not threshold_players:
+            return
+
+        # Filtrar solo jugadores que juegan en este partido
+        relevant = [p for p in threshold_players if p["team_id"] in playing_teams]
+        if not relevant:
+            return
+
+        # Obtener eventos para ver si ya tienen amarilla hoy
+        events = get_fixture_events(fixture_id)
+        players_with_yellow_today = set()
+        for ev in events:
+            if ev.get("type") == "Card" and ev.get("detail") == "Yellow Card":
+                pid = ev.get("player", {}).get("id")
+                if pid:
+                    players_with_yellow_today.add(pid)
+
+        for player in relevant:
+            pid = player["player_id"]
+            pname = player["player_name"]
+            tname = player["team_name"]
+            yellows = player["yellows"]
+
+            # Si ya tiene amarilla hoy, no alertar
+            if pid in players_with_yellow_today:
+                continue
+
+            # Alerta minuto 70
+            key_70 = f"{fixture_id}_{pid}_70"
+            if minute >= 70 and key_70 not in alerted["player_yellow_70"]:
+                alerted["player_yellow_70"].add(key_70)
+                next_games = get_next_fixtures(player["team_id"], league_id, season, 2)
+                next_txt = "\n".join([f"  📅 {g}" for g in next_games]) if next_games else "  No disponible"
+                daily_stats["player_yellow"]["alertas"] += 1
+                weekly_stats["player_yellow"]["alertas"] += 1
+                send_telegram(
+                    f"🟨👤 <b>ALERTA TIPSTER — TARJETA A JUGADOR</b>\n"
+                    f"{league_header}\n"
+                    f"{home['name']} {score_home} - {score_away} {away['name']}\n"
+                    f"👤 {pname} ({tname})\n"
+                    f"🟨 Acumula {yellows} amarillas en temporada\n"
+                    f"⚠️ Sin amarilla en este partido — Min {minute}\n"
+                    f"📆 Próximos partidos:\n{next_txt}"
+                )
+
+            # Alerta minuto 85
+            key_85 = f"{fixture_id}_{pid}_85"
+            if minute >= 85 and key_85 not in alerted["player_yellow_85"]:
+                alerted["player_yellow_85"].add(key_85)
+                next_games = get_next_fixtures(player["team_id"], league_id, season, 2)
+                next_txt = "\n".join([f"  📅 {g}" for g in next_games]) if next_games else "  No disponible"
+                send_telegram(
+                    f"🟨👤 <b>ALERTA TIPSTER — TARJETA A JUGADOR (Min 85)</b>\n"
+                    f"{league_header}\n"
+                    f"{home['name']} {score_home} - {score_away} {away['name']}\n"
+                    f"👤 {pname} ({tname})\n"
+                    f"🟨 Acumula {yellows} amarillas en temporada\n"
+                    f"⚠️ Sigue sin amarilla — Min {minute}\n"
+                    f"📆 Próximos partidos:\n{next_txt}"
+                )
+
+    except Exception as e:
+        log.error(f"Error en player yellow: {e}")
+
+# ============================================================
 # BUCLE PRINCIPAL
 # ============================================================
 def main():
-    log.info("🚀 TipsterBot v6 arrancado!")
+    log.info("🚀 TipsterBot v7 arrancado!")
     send_telegram("🚀 <b>TipsterBot activado</b>\nMonitorizando partidos en tiempo real...")
     cycle = 0
     while True:
@@ -646,6 +956,8 @@ def main():
             for fixture in fixtures:
                 process_fixture(fixture)
                 process_low_yellows(fixture)
+                process_card_stats(fixture)
+                process_player_yellow(fixture)
 
             resolve_finished_fixtures(live_ids)
             check_yellow_cards()
